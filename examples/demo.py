@@ -65,8 +65,8 @@ def run_far_stationary():
     print("시나리오 3: 먼 곳 정지, 뭉침만으로 집이 아님")
     engine = Engine(EngineConfig(home_lat=HOME[0], home_lng=HOME[1]))
     start = datetime(2026, 11, 3, 13, 0, tzinfo=KST)
-    for i in range(4):
-        ts = start + timedelta(minutes=60 * i)
+    for i in range(6):
+        ts = start + timedelta(minutes=10 * i)
         result = engine.update(
             ev(ts, 37.0200, 127.0200, activity="still", is_stationary=True, recent_screen_use=True)
         )
