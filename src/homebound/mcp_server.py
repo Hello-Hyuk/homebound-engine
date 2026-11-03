@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import sys
 
+from . import __version__
 from .cli import run as cli_run
 from .engine import haversine_m
 from .learning import agent_summary
@@ -110,7 +111,7 @@ def handle(request: dict) -> dict | None:
             "result": {
                 "protocolVersion": request.get("params", {}).get("protocolVersion", "2024-11-05"),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "homebound", "version": "0.1.0"},
+                "serverInfo": {"name": "homebound", "version": __version__},
             },
         }
     if method in ("notifications/initialized", "notifications/cancelled"):
@@ -130,6 +131,8 @@ def handle(request: dict) -> dict | None:
                 "id": req_id,
                 "error": {"code": -32603, "message": str(exc)},
             }
+    if req_id is None:
+        return None  # 알 수 없는 알림에는 응답하지 않는다 (JSON-RPC)
     return {
         "jsonrpc": "2.0",
         "id": req_id,
@@ -145,6 +148,15 @@ def main() -> int:
         try:
             request = json.loads(line)
         except json.JSONDecodeError:
+            sys.stdout.write(
+                json.dumps(
+                    {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}}
+                )
+                + "\n"
+            )
+            sys.stdout.flush()
+            continue
+        if not isinstance(request, dict):
             continue
         response = handle(request)
         if response is not None:
