@@ -117,7 +117,7 @@ class Event:
     explicit_with_user: bool | None = None  # True: 명시 확인, False: 명시 부정
 
 
-def companion_status(event: Event, window: list[Event]) -> CompanionStatus:
+def companion_status(event: Event, window: list[Event] | None = None) -> CompanionStatus:
     """v3 8.2 동반 Gate. 불명이면 판정을 보류하는 것이 핵심이다."""
     if event.explicit_with_user is True:
         return CompanionStatus.WITH_USER
@@ -131,13 +131,7 @@ def companion_status(event: Event, window: list[Event]) -> CompanionStatus:
         or event.activity in ("automotive", "cycling", "walking")
     ):
         return CompanionStatus.LIKELY
-    # 장시간 정지 + 활동 없음 + 보조 신호 없음이면 UNKNOWN
-    recent = window[-6:] if window else []
-    if event.is_stationary and all(
-        (not e.watch_connected and not e.car_connected and not e.recent_screen_use)
-        for e in recent
-    ):
-        return CompanionStatus.UNKNOWN
+    # 보조 신호가 하나도 없으면 동반을 단정하지 않는다.
     return CompanionStatus.UNKNOWN
 
 
@@ -191,6 +185,18 @@ class Engine:
         self.entered_at: datetime | None = None
         self.min_distance_since_enter: float | None = None
         self.session_id: str | None = None
+
+    @property
+    def _route_active(self) -> bool:
+        """경로 학습은 학습 동의가 있을 때만 켠다. 동의와 설정이 어긋나면 끈다."""
+        return self.config.learning_enabled and self.config.route_learning_active
+
+    def _reset_session(self) -> None:
+        """귀가 세션 상태를 초기화한다."""
+        self.high_streak = 0
+        self.entered_at = None
+        self.min_distance_since_enter = None
+        self.session_id = None
 
     # -- 내부 계산 -----------------------------------------------------
     def _distance(self, event: Event) -> float:
@@ -279,7 +285,7 @@ class Engine:
             movement_consistency=movement_consistency,
             historical_pattern=hist,
             context=max(0.0, min(1.0, context)),
-            route_match=route_match_value if self.config.route_learning_active else 0.0,
+            route_match=route_match_value if self._route_active else 0.0,
             location_quality=location_quality,
             phone_presence=phone_presence,
         )
@@ -308,10 +314,9 @@ class Engine:
             }
         if not eta_available:
             # ETA 실패 시 나머지 가중치를 비례 재분배한다.
-            eta_w = weights.pop("eta_trend")
+            weights.pop("eta_trend")
             total = sum(weights.values())
             weights = {k: v / total for k, v in weights.items()}
-            _ = eta_w
         values = {
             "distance_trend": features.distance_trend,
             "heading_alignment": features.heading_alignment,
@@ -358,17 +363,26 @@ class Engine:
     ) -> EngineResult:
         if precise is not None:
             event.precise = precise
-        if not event.precise:
-            # 대략 위치 권한이면 방향 계산을 제외하고 최대 등급을 중간으로 제한한다.
-            pass
+        if not self.config.learning_enabled:
+            # 학습 동의가 없으면 학습 유래 신호(패턴, 경로 일치)를 쓰지 않는다.
+            historical_pattern = 0.0
+            historical_count = 0
+            route_match_value = 0.0
+        if self.window and event.ts < self.window[-1].ts:
+            raise ValueError("이벤트는 시간 순으로 넣어야 한다")
 
         self.window.append(event)
-        # 최근 30분 창만 유지한다.
-        cutoff = event.ts - timedelta(minutes=30)
-        self.window = [e for e in self.window if e.ts >= cutoff]
+        # 수정 사항: 시간으로 자르지 않고 점 개수로 유지한다.
+        # 명세는 최근 15~30분 또는 유효 점 4~6개 창이라고 했는데, 이전 코드는
+        # 30분으로 잘라서 메시지 스냅샷처럼 40분 간격으로 들어오는 궤적을
+        # 계속 2개 이하로 만들어 판정을 보류했다. 그래서 마지막 20개 점을
+        # 유지하고, 특징 계산은 마지막 6개 유효 점으로 한다. 점 간격이
+        # 길면 그 사실은 이유에 남기고, 방향은 정확도 합을 넘는 움직임일
+        # 때만 계산하므로 성긴 궤적이 방향을 부풀리지 않는다.
+        self.window = self.window[-20:]
         if eta_minutes is not None:
             self.eta_history.append((event.ts, eta_minutes))
-            self.eta_history = [(t, v) for t, v in self.eta_history if t >= cutoff]
+            self.eta_history = self.eta_history[-20:]
 
         companion = companion_status(event, self.window)
         distance = self._distance(event)
@@ -377,6 +391,7 @@ class Engine:
 
         if companion in (CompanionStatus.UNKNOWN, CompanionStatus.NOT_WITH_USER):
             self.state = State.UNKNOWN
+            self._reset_session()
             reasons.append("휴대폰 동반이 확인되지 않아 판정을 보류한다")
             return EngineResult(
                 state=self.state,
@@ -405,14 +420,23 @@ class Engine:
                 reasons=reasons,
             )
 
+        # 성긴 궤적 표시: 점 간격이 30분을 넘으면 이유에 남긴다.
+        # 간격이 길다고 판정을 버리지는 않지만, 방향과 이동 신호는
+        # 정확도와 정지 여부로 이미 제한되므로 과대 평가되지 않는다.
+        gaps_min = [
+            (b.ts - a.ts).total_seconds() / 60.0 for a, b in zip(valid, valid[1:])
+        ]
+        if gaps_min and max(gaps_min) > 30:
+            reasons.append(f"점 간격이 길다. 최대 간격 {max(gaps_min):.0f}분, 성긴 궤적이다")
+
         features = self._features(
             valid, companion, eta_minutes, historical_pattern, historical_count, context, route_match_value
         )
         # 대략 위치 권한이면 방향을 제외한다.
         if not event.precise:
             features.heading_alignment = 0.0
-        homebound, effective = self._score(features, eta_minutes is not None, self.config.route_learning_active)
-        grade = self._grade(effective, eta_minutes is not None, self.config.route_learning_active, route_match_value)
+        homebound, effective = self._score(features, eta_minutes is not None, self._route_active)
+        grade = self._grade(effective, eta_minutes is not None, self._route_active, route_match_value)
         if not event.precise and grade in (Grade.HIGH, Grade.VERY_HIGH):
             grade = Grade.MEDIUM
 
@@ -420,7 +444,11 @@ class Engine:
         prev_state = self.state
         if self.state == State.PASS_THROUGH:
             self.state = State.MOVING
-            self.session_id = None
+            self._reset_session()
+        elif self.state == State.ARRIVED_HOME and distance > HOME_EXIT_M:
+            # 도착 뒤 집을 다시 나서면 세션을 닫고 이동 상태로 돌린다.
+            self.state = State.MOVING
+            self._reset_session()
         if event.is_stationary and distance > HOME_EXIT_M and self.state in (State.UNKNOWN,):
             self.state = State.STATIONARY
         elif not event.is_stationary and self.state == State.UNKNOWN:
@@ -458,10 +486,11 @@ class Engine:
             assert self.min_distance_since_enter is not None
             self.min_distance_since_enter = min(self.min_distance_since_enter, distance)
             dwell = event.ts - self.entered_at
-            if distance > HOME_EXIT_M:
+            if distance > HOME_EXIT_M or (distance > HOME_ENTER_M and dwell <= PASS_THROUGH_WINDOW):
                 # 5분 내 이탈 또는 250m 초과: 통과
                 self.state = State.PASS_THROUGH
                 self.entered_at = None
+                self.min_distance_since_enter = None
                 reasons.append("집 반경을 벗어나 통과로 판정한다")
             elif dwell >= ARRIVAL_DWELL and event.is_stationary and aux_arrival_signal:
                 self.state = State.ARRIVED_HOME
@@ -470,13 +499,6 @@ class Engine:
                 reasons.append("도착 후보이다. 보조 신호가 없어 확정하지 않는다")
         # 통과 상태는 이번 업데이트 결과로 남기고, 다음 업데이트에서 MOVING으로 돌아간다.
         # 통과는 외출로 보지 않는다.
-
-        if self.state in (State.HOMEBOUND, State.APPROACHING_HOME, State.ARRIVED_HOME):
-            if distance < (self.min_distance_since_enter or distance):
-                pass
-        if distance > HOME_EXIT_M and self.state == State.HOMEBOUND:
-            # 거리 증가 지속은 별도 호출에서 window로 확인한다. 여기서는 상태만 유지한다.
-            pass
 
         if prev_state != self.state:
             reasons.append(f"상태 전환 {prev_state.value}에서 {self.state.value}로")
