@@ -5,6 +5,7 @@ v3 명세의 핵심만 구현한다. 자동 제어를 하지 않고, 제안 후�
 도착 예상 시간, 머무름 시간 같은 요약만 들어간다.
 """
 
+from .accumulator import accumulate
 from .engine import (
     CompanionStatus,
     Engine,
@@ -27,6 +28,7 @@ from .learning import (
 )
 
 __all__ = [
+    "accumulate",
     "CompanionStatus",
     "Engine",
     "EngineConfig",
