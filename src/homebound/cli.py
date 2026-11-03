@@ -128,17 +128,42 @@ def run(payload: dict) -> dict:
     }
 
 
-def main(argv: list[str]) -> int:
-    if len(argv) > 1:
-        with open(argv[1], encoding="utf-8") as f:
-            payload = json.load(f)
-    else:
-        payload = json.load(sys.stdin)
-    output = run(payload)
+def main(argv: list[str] | None = None) -> int:
+    # 누적 모드: python3 -m homebound.cli --history <경로> <입력.json>
+    # 입력에 new_events가 있으면 그것을 새 점으로 쓰고, 없으면 events를 쓴다.
+    argv = sys.argv if argv is None else argv
+    try:
+        args = list(argv[1:])
+        history_path = None
+        if "--history" in args:
+            idx = args.index("--history")
+            history_path = args[idx + 1]
+            del args[idx : idx + 2]
+        if args:
+            with open(args[0], encoding="utf-8") as f:
+                payload = json.load(f)
+        else:
+            payload = json.load(sys.stdin)
+        if history_path is not None:
+            # 지연 임포트로 순환 임포트를 피한다.
+            from .accumulator import accumulate
+
+            new_events = payload.get("new_events", payload.get("events", []))
+            output = accumulate(
+                history_path=history_path,
+                config=payload.get("config", {}),
+                new_events=new_events,
+                max_per_day=int(payload.get("policy", {}).get("max_per_day", 2)),
+            )
+        else:
+            output = run(payload)
+    except (OSError, json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+        sys.stderr.write(f"입력 오류: {type(exc).__name__}: {exc}\n")
+        return 2
     json.dump(output, sys.stdout, ensure_ascii=False, indent=2)
     sys.stdout.write("\n")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))
+    raise SystemExit(main())
